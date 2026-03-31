@@ -9,7 +9,7 @@ import { Auth } from "../auth"
 import { Flag } from "../flag/flag"
 import { ProviderID } from "../provider/schema"
 import { WorkspaceRouterMiddleware } from "./router"
-import { websocket } from "hono/bun"
+import { createAdaptorServer, type ServerType } from "@hono/node-server"
 import { errors } from "./error"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
@@ -24,6 +24,13 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 initProjectors()
 
 export namespace Server {
+  export type Listener = {
+    hostname: string
+    port: number
+    url: URL
+    stop: (close?: boolean) => Promise<void>
+  }
+
   const log = Log.create({ service: "server" })
 
   const zipped = compress()
@@ -261,52 +268,85 @@ export namespace Server {
     return result
   }
 
-  /** @deprecated do not use this dumb shit */
   export let url: URL
 
-  export function listen(opts: {
+  export async function listen(opts: {
     port: number
     hostname: string
     mdns?: boolean
     mdnsDomain?: string
     cors?: string[]
-  }) {
-    url = new URL(`http://${opts.hostname}:${opts.port}`)
+  }): Promise<Listener> {
     const app = ControlPlaneRoutes({ cors: opts.cors })
-    const args = {
-      hostname: opts.hostname,
-      idleTimeout: 0,
-      fetch: app.fetch,
-      websocket: websocket,
-    } as const
-    const tryServe = (port: number) => {
-      try {
-        return Bun.serve({ ...args, port })
-      } catch {
-        return undefined
-      }
+    const start = (port: number) =>
+      new Promise<ServerType>((resolve, reject) => {
+        const server = createAdaptorServer({ fetch: app.fetch })
+        const fail = (err: Error) => {
+          cleanup()
+          reject(err)
+        }
+        const ready = () => {
+          cleanup()
+          resolve(server)
+        }
+        const cleanup = () => {
+          server.off("error", fail)
+          server.off("listening", ready)
+        }
+        server.once("error", fail)
+        server.once("listening", ready)
+        server.listen(port, opts.hostname)
+      })
+
+    const server = opts.port === 0 ? await start(4096).catch(() => start(0)) : await start(opts.port)
+    const addr = server.address()
+    if (!addr || typeof addr === "string") {
+      throw new Error(`Failed to resolve server address for port ${opts.port}`)
     }
-    const server = opts.port === 0 ? (tryServe(4096) ?? tryServe(0)) : tryServe(opts.port)
-    if (!server) throw new Error(`Failed to start server on port ${opts.port}`)
+
+    const next = new URL("http://localhost")
+    next.hostname = opts.hostname
+    next.port = String(addr.port)
+    url = next
 
     const shouldPublishMDNS =
       opts.mdns &&
-      server.port &&
+      addr.port &&
       opts.hostname !== "127.0.0.1" &&
       opts.hostname !== "localhost" &&
       opts.hostname !== "::1"
     if (shouldPublishMDNS) {
-      MDNS.publish(server.port!, opts.mdnsDomain)
+      MDNS.publish(addr.port, opts.mdnsDomain)
     } else if (opts.mdns) {
       log.warn("mDNS enabled but hostname is loopback; skipping mDNS publish")
     }
 
-    const originalStop = server.stop.bind(server)
-    server.stop = async (closeActiveConnections?: boolean) => {
-      if (shouldPublishMDNS) MDNS.unpublish()
-      return originalStop(closeActiveConnections)
+    let closing: Promise<void> | undefined
+    return {
+      hostname: opts.hostname,
+      port: addr.port,
+      url: next,
+      stop(close?: boolean) {
+        closing ??= new Promise((resolve, reject) => {
+          if (shouldPublishMDNS) MDNS.unpublish()
+          server.close((err) => {
+            if (err) {
+              reject(err)
+              return
+            }
+            resolve()
+          })
+          if (close) {
+            if ("closeAllConnections" in server && typeof server.closeAllConnections === "function") {
+              server.closeAllConnections()
+            }
+            if ("closeIdleConnections" in server && typeof server.closeIdleConnections === "function") {
+              server.closeIdleConnections()
+            }
+          }
+        })
+        return closing
+      },
     }
-
-    return server
   }
 }
