@@ -33,6 +33,8 @@ import path from "path"
 import { Global } from "./global"
 import { JsonMigration } from "./storage/json-migration"
 import { Database } from "./storage/db"
+import { drizzle } from "drizzle-orm/bun-sqlite"
+import { Database as BunDatabase } from "bun:sqlite"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 
@@ -102,9 +104,10 @@ const cli = yargs(hideBin(process.argv))
       const muted = "\x1b[0;2m"
       const reset = "\x1b[0m"
       let last = -1
+      const sqlite = new BunDatabase(Database.Path)
       if (tty) process.stderr.write("\x1b[?25l")
       try {
-        await JsonMigration.run(Database.Client().$client, {
+        await JsonMigration.run(drizzle({ client: sqlite }), {
           progress: (event) => {
             const percent = Math.floor((event.current / event.total) * 100)
             if (percent === last && event.current !== event.total) return
@@ -122,6 +125,7 @@ const cli = yargs(hideBin(process.argv))
           },
         })
       } finally {
+        sqlite.close()
         if (tty) process.stderr.write("\x1b[?25h")
         else {
           process.stderr.write(`sqlite-migration:done${EOL}`)
